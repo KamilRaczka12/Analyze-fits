@@ -1,12 +1,13 @@
 from importlib.resources import path
 # from inspect import _Object
-from astropy.io import fits
+from astropy.io import fits, ascii
 from astropy.table import Table
 from astropy.coordinates import SkyCoord, Angle
 from astropy import units as u
 from astroquery.jplhorizons import Horizons
 from datetime import datetime
 import glob
+import logging
 import numpy as np
 import os
 import pandas as pd
@@ -14,84 +15,108 @@ from photutils.datasets import make_100gaussians_image
 from photutils.aperture import CircularAperture
 
 
-def do_the_work(path_to_folder, obj_id, step, comp_stars_file, key_list):
-    dict_ = create_dict(key_list)
-    analysed_objects = ['OBJ']
-    if os.path.exists(path_to_folder + comp_stars_file):
-        dict_new, n_of_comp_stars, comp_stars_table = to_dict_add_comp_star_keys(dict_, comp_stars_file, key_list)
-        dict_ = dict_new
-        analysed_objects = list_of_objects(analysed_objects, n_of_comp_stars)
-    fits_images = sorted(glob.glob(path_to_folder + "*.fit*"))
-    cat_file_list = sorted(glob.glob(path_to_folder + "*.cat"))
-    images_date_list, start_date, stop_date, julian_date_list = get_dates(fits_images)
-    dict_ = fill_dict_with_dates(images_date_list, julian_date_list, dict_)
-    eph = give_horizons_table(obj_id, start_date, stop_date, step)
-    horizons_table = eph.to_pandas()
-    horizon_iso_dates = give_horizon_iso_dates(horizons_table['datetime_str'])
-    closest_dates_list = give_closest_dates_list(images_date_list, horizon_iso_dates)
-    date_ra_dec_table = link_date_to_ra_dec(closest_dates_list, horizons_table, horizon_iso_dates)
-    dict_ = return_filled_dict(analysed_objects, cat_file_list, date_ra_dec_table, comp_stars_table, dict_)
-    make_output_file(path_to_folder, dict_)
-    
+logging.basicConfig(filename='FitsAndCatsToTable.log', filemode='w', 
+                    format='%(levelname)s:%(message)s',
+                    encoding='utf-8', level=logging.INFO)
 
 
-def create_dict(key_list):
-    dict_ = {'IDX' : [], 'DT' : [], 'JD' : []}
-    for key in key_list:
-        key_ = key + '_OBJ'
-        dict_[key_] = []
+def main(input_dict):
+    fits_images = sorted(glob.glob(input_dict['path_to_folder'] + "*.fit*"))
+    cat_files = sorted(glob.glob(input_dict['path_to_folder'] + "*.cat"))
+    cs_file_exists = check_if_all_input_variables_filled(**input_dict)
+    output_dict, date_ra_dec_table = get_dict_with_date_and_position(fits_images, input_dict)
+    output_dict = get_dict_with_objs_info(cat_files, date_ra_dec_table, output_dict, cs_file_exists, **input_dict)
+    logging.info('Succesfully created output dictionary.')
+    make_output_file(output_dict, **input_dict)
+
+
+def check_if_all_input_variables_filled(path_to_folder, obj_id, step, date_key_list, objects_key_list, cs_file, **kwargs):
+    if not all([path_to_folder, obj_id, step, date_key_list, objects_key_list]):
+        logging.critical('One or more input variables empty!')
+        raise ValueError('One or more variables are missing')
+    elif os.path.exists(path_to_folder + cs_file):
+        logging.info('All input variables filled.')
+        return True
+    else:
+        logging.info('All input variables filled, "cs_file" file was not found.')
+        return False
+
+
+def create_dict(dict_, key_list, objects):
+    for adj in objects:
+        for key in key_list:
+            key_ = key + '_' + adj
+            dict_[key_] = []
     return dict_
 
 
-def to_dict_add_comp_star_keys(dict_, comp_stars_file, key_list):
-    comp_stars_table = pd.read_csv(path_to_folder + comp_stars_file)
-    n_of_comp_stars = len(comp_stars_table.index)
-    for n in range(n_of_comp_stars):
-        new_keys = []
-        for key in key_list:
-            new_keys.append(key + '_COMP' + str(n + 1))
-        for key in new_keys:
-            dict_[key] = []
-    return dict_, n_of_comp_stars, comp_stars_table
+def get_file_name(image):
+    pathname = os.path.splitext(image)[0]	
+    image_name = pathname.split('/')[-1]
+    return image_name
 
 
-def list_of_objects(analysed_objects, n_of_comp_stars):
-    for i in range(n_of_comp_stars):
-        analysed_objects.append('COMP' + str(i + 1))
-    return analysed_objects
+def get_dict_with_date_and_position(fits_images, input_dict):
+    start_date, stop_date, images_date_list, julian_date_list = get_dates(fits_images, **input_dict)
+    horizons_table = get_horizons_table(start_date, stop_date, **input_dict)
+    horizon_iso_dates = get_horizon_iso_dates(horizons_table['datetime_str'])
+    closest_dates_list = get_closest_dates_list(images_date_list, horizon_iso_dates)
+    date_ra_dec_table = link_date_to_ra_dec(closest_dates_list, horizons_table, horizon_iso_dates)
+    output_dict = get_dict_with_dates(images_date_list, julian_date_list, **input_dict)
+    return output_dict, date_ra_dec_table
 
 
-def get_dates(fits_images):
+def get_dates(fits_images, date_hdrs_dict, **kwargs):
     images_date_list = []
     julian_date_list = []
     for image in fits_images:
+        im_name = get_file_name(image)
         hdul = fits.open(image)
-        date = hdul[0].header['DATE-OBS']
-        julian_date = hdul[0].header['JD']
-        if len(date) == 22:
+        try:
+            date = hdul[0].header[date_hdrs_dict['date']]
+        except KeyError:
+            logging.critical('Couldn`t find header %s in image %s!', date_hdrs_dict['date'], im_name)
+            raise KeyError('Header was not found in the targeted fits image')
+        if date and len(date) == 22:
             date = date + '0'
+        try:
+            julian_date = hdul[0].header[date_hdrs_dict['julian_date']]
+        except KeyError:
+            logging.critical('Couldn`t find header %s in image %s!', date_hdrs_dict['julian_date'], im_name)
+            raise KeyError('Header was not found in the targeted fits image')
         images_date_list.append(date)
         julian_date_list.append(julian_date)
+    logging.info('Succesfully extracted dates from fits images.')
+    images_date_list = sorted(images_date_list)
+    julian_date_list = sorted(julian_date_list)
+    start_date, stop_date = get_first_and_last_date(images_date_list)
+    return start_date, stop_date, images_date_list, julian_date_list
+
+
+def get_first_and_last_date(images_date_list):
     date1 = images_date_list[0]
     date2 = images_date_list[-1]
     start_date = date1.replace('T', ' ')
     stop_date = date2.replace('T', ' ')
-    # head1, sep1, tail1 = date1.partition('T')
-    # head2, sep2, tail2 = date2.partition('T')
-    # start_date = head1
-    # stop_date = head2
-    # if start_date == stop_date:
-    #     f"{start_date} [ {tail1} ]"
-    #     start_date = start_date + ' [' + tail1 + ']'
-    #     stop_date = stop_date + ' [' + tail2 + ']'
-    return images_date_list, start_date, stop_date, julian_date_list
+    return start_date, stop_date
 
 
-def fill_dict_with_dates(images_date_list, julian_date_list, dict_):
-    for n, date in enumerate(images_date_list):
-        dict_['IDX'].append(str(n + 1))
-        dict_['DT'].append(images_date_list[n])
-        dict_['JD'].append(julian_date_list[n])
+def get_horizons_table(start_date, stop_date, obj_id, step, **kwargs):
+    obj = Horizons(id = obj_id,
+               epochs={'start' : start_date,
+                       'stop' : stop_date,
+                       'step' : step})
+    eph = obj.ephemerides(quantities=1)
+    horizons_table = eph.to_pandas()
+    return horizons_table
+
+
+def get_dict_with_dates(images_date_list, julian_date_list, date_key_list, **kwargs):
+    n_idx = np.arange(1, len(images_date_list) + 1, 1)
+    list_ = [n_idx, images_date_list, julian_date_list]
+    dict_ = {}
+    for n, key in enumerate(date_key_list):
+        dict_[key] = list_[n]
     return dict_
 
 
@@ -149,14 +174,6 @@ def change_date_format_int_to_str(date):
     return date
 
 
-def give_horizons_table(obj_id, start_date, stop_date, step):
-    obj = Horizons(id = obj_id,
-               epochs={'start' : start_date,
-                       'stop' : stop_date,
-                       'step' : step})
-    return obj.ephemerides(quantities=1)
-
-
 def table_with_iso_date_format(table):
     # print(table)
     for n, date in enumerate(table['datetime_str']):
@@ -168,7 +185,7 @@ def table_with_iso_date_format(table):
     return table
 
 
-def give_horizon_iso_dates(horizon_dates):
+def get_horizon_iso_dates(horizon_dates):
     horizon_iso_dates = []
     for date in horizon_dates:
         date = change_date_format_str_to_int(date)
@@ -176,7 +193,7 @@ def give_horizon_iso_dates(horizon_dates):
     return horizon_iso_dates
 
 
-def give_closest_dates_list(images_date_list, horizon_iso_dates):
+def get_closest_dates_list(images_date_list, horizon_iso_dates):
     closest_dates = []
     for date in images_date_list:
         date_ = find_closest_date(date, horizon_iso_dates)
@@ -202,30 +219,56 @@ def link_date_to_ra_dec(closest_dates_list, horizons_table, horizon_iso_dates):
     for date in closest_dates_list:
         idx = 0
         for date_ in horizon_iso_dates:
-            # print(date, date_)
             if date == date_:
                 break
             idx += 1
         dict_['date_iso'].append(horizon_iso_dates[idx])
-        # dict_['date_iso'] = table['datetime_str'][idx]
         dict_['RA'].append(horizons_table['RA'][idx])
         dict_['DEC'].append(horizons_table['DEC'][idx])
     return pd.DataFrame.from_dict(dict_)
-    
 
-def read_sextractor_files(file_name):
-    sex_catalog = pd.read_fwf(file_name,
-                header=None, skiprows=range(0,12),
-                names=['NUMBER', 'X_IMAGE', 'Y_IMAGE', 'ALPHA_SKY', 'DELTA_SKY',
-                'MAG_ISO', 'MAGERR_ISO', 'FLUX_ISO', 'FLUXERR_ISO',
-                'A_IMAGE', 'B_IMAGE', 'THETA_IMAGE'])
+
+def get_dict_with_objs_info(cat_files, date_ra_dec_table, output_dict, cs_file_exists, cs_file, objects_key_list, path_to_folder, **kwargs):
+    objects = ['OBJ']
+    if cs_file_exists:
+        comp_stars_table = pd.read_csv(path_to_folder + cs_file)
+        n = comp_stars_table.shape[0]
+        for i in range(n):
+            objects.append('COMP' + str(i+1))
+    for obj in objects:
+        for n, cat_file in enumerate(cat_files):
+            if obj == 'OBJ':
+                RA = date_ra_dec_table['RA'][n]
+                DEC = date_ra_dec_table['DEC'][n]
+            else:
+                RA = comp_stars_table.iloc[0][2]
+                DEC = comp_stars_table.iloc[0][3]
+            if n == 0:
+                obj_info = from_sex_get_obj(RA, DEC, cat_file, obj, objects_key_list)
+            else:
+                next_obj_info = from_sex_get_obj(RA, DEC, cat_file, obj, objects_key_list)
+                obj_info = pd.concat([obj_info, next_obj_info], axis=0)
+        output_dict = to_dict_add_obj_keys(obj, obj_info, output_dict, objects_key_list)
+    return output_dict
+
+
+def from_sex_get_obj(RA, DEC, cat_file, obj, key_list):
+    sex_catalog = read_sex_file(cat_file)
+    idx = find_closest_object(RA, DEC, sex_catalog, k=Angle('0d00m10s'))
+    obj_info = sex_catalog.iloc[[idx]]
+    return obj_info
+
+
+def read_sex_file(file_name):
+    data = ascii.read(file_name, format='sextractor')
+    sex_catalog = data.to_pandas()
     return sex_catalog 
 
 
-def find_closest_object(RA, DEC, sex_catalog):
+def find_closest_object(RA, DEC, sex_catalog, k):
     c = SkyCoord(ra=RA*u.degree, dec=DEC*u.degree)
     min_distance = np.inf
-    k = Angle('0d00m10s')
+    # k = Angle('0d00m10s')
     for i in range(len(sex_catalog['NUMBER'])):
         ra2 = np.array([sex_catalog['ALPHA_SKY'][i]])
         dec2 = np.array([sex_catalog['DELTA_SKY'][i]])
@@ -237,46 +280,18 @@ def find_closest_object(RA, DEC, sex_catalog):
     return idx_
 
 
-def from_sex_get_obj(RA, DEC, cat_file, dict_, obj):
-    sex_catalog = read_sextractor_files(cat_file)
-    idx = find_closest_object(RA, DEC, sex_catalog)
-    obj_info = sex_catalog.iloc[[idx]]
-    obj_dict = append_to_dict(obj_info, dict_, obj)
-    return obj_dict
+def to_dict_add_obj_keys(obj, obj_info, output_dict, objects_key_list):
+    used_sex_catalog_keys = ['ALPHA_SKY', 'DELTA_SKY', 'X_IMAGE', 'Y_IMAGE', 'FLUX_ISO',
+                             'FLUXERR_ISO', 'A_IMAGE', 'B_IMAGE', 'THETA_IMAGE']
+    for n, key in enumerate(objects_key_list):
+        list_ = obj_info[used_sex_catalog_keys[n]].tolist()
+        to_join = [key, '_', obj]
+        dict_key = ''.join(to_join)
+        output_dict[dict_key] = list_
+    return output_dict
 
 
-def append_to_dict(obj_info, dict_, obj):
-    dict_['RA' + '_' + obj].append(obj_info.iloc[0]['ALPHA_SKY'])
-    dict_['DEC' + '_' + obj].append(obj_info.iloc[0]['DELTA_SKY'])
-    dict_['X' + '_' + obj].append(obj_info.iloc[0]['X_IMAGE'])
-    dict_['Y' + '_' + obj].append(obj_info.iloc[0]['Y_IMAGE'])
-    dict_['FLUX' + '_' + obj].append(obj_info.iloc[0]['FLUX_ISO'])
-    dict_['FLUX_ERR' + '_' + obj].append(obj_info.iloc[0]['FLUXERR_ISO'])
-    dict_['A_IMAGE' + '_' + obj].append(obj_info.iloc[0]['A_IMAGE'])
-    dict_['B_IMAGE' + '_' + obj].append(obj_info.iloc[0]['B_IMAGE'])
-    dict_['THETA_IMAGE' + '_' + obj].append(obj_info.iloc[0]['THETA_IMAGE'])
-    return dict_
-
-
-def return_filled_dict(analysed_objects, cat_file_list, date_ra_dec_table, comp_stars_table, dict_):
-    for obj in analysed_objects:
-        if obj == 'OBJ':
-            for n, cat_file in enumerate(cat_file_list):
-                RA = date_ra_dec_table['RA'][n]
-                DEC = date_ra_dec_table['DEC'][n]
-                dict_new = from_sex_get_obj(RA, DEC, cat_file, dict_, obj)
-                dict_ = dict_new
-        else:
-            for n, cat_file in enumerate(cat_file_list):
-                RA = comp_stars_table.loc[0][2]
-                DEC = comp_stars_table.iloc[0][3]
-                dict_new = from_sex_get_obj(RA, DEC, cat_file, dict_, obj)
-                dict_ = dict_new
-    return dict_
-
-
-
-def make_output_file(path_to_folder, dict_):
+def make_output_file(dict_, path_to_folder, **input_dict):
     file_ = path_to_folder + 'output_file.csv'
     s = ', '
     s = s.join(list(dict_.keys()))
@@ -293,16 +308,27 @@ def make_output_file(path_to_folder, dict_):
         file_line = s + sp
         output_file.write(file_line)
     output_file.close()
+    if os.path.exists(file_):
+        logging.info('Succesfully created output file.')
+    else:
+        logging.warning('Output file was not created.')
 
 
 
 
 
-# path_to_folder = '/home/kamilraczka/Projects/Fits_files/'
-path_to_folder = '/home/kamilraczka/Projects/Na_zaliczenie/'
-# path_to_folder = '/home/kamil/Astronomia/Fits_files/'
-obj_id = 'Gunlod'
-step = '1m'
-key_list = ['RA', 'DEC', 'X', 'Y', 'FLUX', 'FLUX_ERR', 'A_IMAGE', 'B_IMAGE', 'THETA_IMAGE']
-comp_stars_file = 'comp-stars.csv'
-do_the_work(path_to_folder, obj_id, step, comp_stars_file, key_list)
+# 'path_to_folder' : '/home/kamilraczka/Projects/Fits_files/'
+# 'path_to_folder' : '/home/kamilraczka/Projects/Na_zaliczenie/'
+# 'path_to_folder' : '/home/kamil/Astronomia/Fits_files/'
+input_dict = {'path_to_folder' : '/home/kamil/Programs/Analyze-fits/Fits_files/',
+'obj_id' : 'Delia',
+'step' : '1m',
+# 'date_hdrs_dict': {'date': 'DATE-OBS', 'julian_date': 'JD'},
+'date_hdrs_dict': {'date': 'DATE-OBS', 'julian_date': 'JD_UTC'},
+'date_key_list' : ['IDX', 'DT', 'JD'],
+'objects_key_list' : ['RA', 'DEC', 'X', 'Y', 'FLUX', 'FLUX_ERR', 'A_IMAGE', 'B_IMAGE', 'THETA_IMAGE'],
+'cs_file' : 'comp_stars.csv'
+}
+
+if __name__ == '__main__':
+    main(input_dict)
